@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>分区文件密钥轮换控制台</title>
+<style>
+  :root {
+    --bg:#0f141b; --panel:#171f2a; --line:#263242; --text:#e6edf3;
+    --muted:#8b98a8; --accent:#4f9cff; --ok:#3fb950; --warn:#d29922;
+    --bad:#f85149; --chip:#213044;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text);
+         font:14px/1.55 -apple-system,Segoe UI,Roboto,"PingFang SC","Microsoft YaHei",sans-serif; }
+  header { padding:18px 26px; border-bottom:1px solid var(--line);
+           display:flex; align-items:baseline; gap:14px; }
+  header h1 { font-size:18px; margin:0; }
+  header span { color:var(--muted); font-size:12px; }
+  main { display:grid; grid-template-columns:1fr 1fr; gap:18px; padding:20px 26px; }
+  .panel { background:var(--panel); border:1px solid var(--line);
+           border-radius:10px; padding:16px 18px; }
+  .panel h2 { margin:0 0 12px; font-size:14px; color:var(--accent);
+              text-transform:uppercase; letter-spacing:.06em; }
+  .full { grid-column:1 / -1; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th,td { text-align:left; padding:7px 9px; border-bottom:1px solid var(--line); }
+  th { color:var(--muted); font-weight:600; }
+  button,select { background:var(--chip); color:var(--text); border:1px solid var(--line);
+          border-radius:7px; padding:7px 13px; font-size:13px; cursor:pointer; margin:2px 4px 2px 0; }
+  button:hover { border-color:var(--accent); }
+  button.danger { border-color:#5c2b2b; }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  .chip { display:inline-block; padding:2px 9px; border-radius:999px;
+          font-size:12px; background:var(--chip); }
+  .ok { color:var(--ok); } .failed { color:var(--bad); } .pending { color:var(--warn); }
+  .state-active { color:var(--ok); } .state-retired { color:var(--warn); }
+  .state-disabled { color:var(--muted); }
+  .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  pre { background:#0b1016; border:1px solid var(--line); border-radius:8px;
+        padding:12px; max-height:240px; overflow:auto; font-size:12px; white-space:pre-wrap; }
+  .muted { color:var(--muted); font-size:12px; }
+  .progress { height:8px; background:#0b1016; border-radius:999px; overflow:hidden; margin:8px 0; }
+  .progress > div { height:100%; background:var(--accent); transition:width .3s; }
+  #toast { position:fixed; right:20px; bottom:20px; max-width:420px; }
+  .toast-item { background:var(--chip); border:1px solid var(--line); border-radius:8px;
+                padding:10px 14px; margin-top:8px; font-size:13px; }
+  .toast-item.err { border-color:var(--bad); }
+</style>
+</head>
+<body>
+<header>
+  <h1>🔐 分区文件密钥轮换控制台</h1>
+  <span>每文件实际密钥版本登记 · 原子重写 · 查询零中断 · 密钥仅存本地私有配置</span>
+</header>
+
+<main>
+  <!-- 密钥版本 -->
+  <section class="panel">
+    <h2>① 密钥版本登记（本地私有，不含密钥本体）</h2>
+    <div class="row" style="margin-bottom:10px">
+      <button onclick="createKey()">登记新版本密钥</button>
+      <span class="muted">新版本生成后可作为轮换目标</span>
+    </div>
+    <table>
+      <thead><tr><th>版本</th><th>状态</th><th>当前</th><th>文件引用</th><th>在途下载</th><th>操作</th></tr></thead>
+      <tbody id="keys-body"></tbody>
+    </table>
+  </section>
+
+  <!-- 旧密钥合法引用 -->
+  <section class="panel">
+    <h2>② 仍有合法引用的旧密钥</h2>
+    <p class="muted">停用（销毁密钥）条件：文件引用 = 0 且在途下载 = 0；当前加密密钥不可停用。</p>
+    <table>
+      <thead><tr><th>旧版本</th><th>状态</th><th>文件引用</th><th>在途</th><th>能否停用</th></tr></thead>
+      <tbody id="old-body"></tbody>
+    </table>
+  </section>
+
+  <!-- 轮换控制 -->
+  <section class="panel full">
+    <h2>③ 轮换任务（后台逐文件重写）</h2>
+    <div class="row">
+      <label>目标版本
+        <select id="target-version"></select>
+      </label>
+      <label>策略
+        <select id="mode">
+          <option value="mixed">兼容混合（逐文件迁移，旧密钥保留可用）</option>
+          <option value="cutover">整版切换（全部成功后旧密钥自动转为仅解密）</option>
+        </select>
+      </label>
+      <button onclick="startRotation()">启动轮换</button>
+      <button onclick="post('/api/rotation/pause')">暂停</button>
+      <button onclick="post('/api/rotation/resume')">恢复</button>
+      <button onclick="post('/api/rotation/retry')">重试失败文件</button>
+    </div>
+    <div id="job-meta" class="muted" style="margin-top:10px">暂无任务</div>
+    <div class="progress"><div id="bar" style="width:0%"></div></div>
+    <table>
+      <thead><tr><th>文件</th><th>原版本</th><th>状态</th><th>错误</th><th>完成时间</th></tr></thead>
+      <tbody id="job-body"></tbody>
+    </table>
+    <h2 style="margin-top:16px">任务日志</h2>
+    <pre id="job-log">（空）</pre>
+  </section>
+
+  <!-- 文件清单 -->
+  <section class="panel full">
+    <h2>④ 分区文件清单（逐文件标明实际所用密钥版本）</h2>
+    <table>
+      <thead><tr><th>文件</th><th>实际密钥版本</th><th>明文 SHA-256</th><th>大小</th>
+        <th>校验状态</th><th>操作</th></tr></thead>
+      <tbody id="files-body"></tbody>
+    </table>
+  </section>
+
+  <!-- 查询下载 -->
+  <section class="panel full">
+    <h2>⑤ 查询 / 下载（轮换期间一致读，下载包不含任何密钥）</h2>
+    <div class="row">
+      <select id="query-file"></select>
+      <button onclick="queryFile()">查询明文</button>
+      <button onclick="downloadFile()">下载 ZIP 包</button>
+      <span class="muted">下载包仅含明文 CSV + MANIFEST.json，无密钥/nonce/容器</span>
+    </div>
+    <pre id="query-out" style="margin-top:10px">（查询结果显示在这里）</pre>
+  </section>
+</main>
+
+<div id="toast"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+
+async function api(path, opts={}) {
+  const res = await fetch(path, {
+    headers:{'Content-Type':'application/json'}, ...opts,
+    body: opts.body ? JSON.stringify(opts.body) : undefined
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
+  return data;
+}
+const post = (p, body) => api(p, {method:'POST', body: body||{}});
+
+function toast(msg, isErr=false) {
+  const el = document.createElement('div');
+  el.className = 'toast-item' + (isErr ? ' err' : '');
+  el.textContent = msg;
+  $('toast').appendChild(el);
+  setTimeout(() => el.remove(), 4500);
+}
+async function safe(fn) { try { await fn(); } catch (e) { toast(e.message, true); } }
+
+async function createKey() { await safe(async () => {
+  const r = await post('/api/keys'); toast('已登记密钥 ' + r.version); refresh();
+});}
+async function startRotation() { await safe(async () => {
+  const r = await post('/api/rotation/start', {
+    target_version: $('target-version').value, mode: $('mode').value });
+  toast('任务 ' + r.job_id + ' 已启动'); refresh();
+});}
+async function injectFault(id) { await safe(async () => {
+  await post('/api/fault/inject', {file_id:id}); toast('已对 ' + id + ' 注入篡改'); refresh();
+});}
+async function recover(id) { await safe(async () => {
+  const r = await post('/api/fault/recover', {file_id:id});
+  toast(id + ' 已恢复，校验=' + r.verify_status); refresh();
+});}
+async function verify(id) { await safe(async () => {
+  const r = await post('/api/verify', {file_id:id});
+  toast(id + ' 校验 ' + r.verify_status); refresh();
+});}
+async function retire(v) { await safe(async () => {
+  await post('/api/keys/retire', {version:v}); toast(v + ' 已转为仅解密'); refresh();
+});}
+async function disableKey(v) {
+  if (!confirm('确认停用 ' + v + '？密钥本体将被销毁且不可恢复。')) return;
+  await safe(async () => {
+    await post('/api/keys/disable', {version:v}); toast(v + ' 已停用，密钥已销毁'); refresh();
+  });
+}
+async function queryFile() { await safe(async () => {
+  const id = $('query-file').value;
+  const r = await api('/api/query/' + encodeURIComponent(id));
+  $('query-out').textContent =
+    'file_id: ' + r.file_id + '\nkey_version: ' + r.key_version +
+    '\nsha256: ' + r.plaintext_sha256 + '\n\n' + r.content;
+});}
+function downloadFile() {
+  const id = $('query-file').value;
+  window.location = '/api/download/' + encodeURIComponent(id);
+}
+
+function chip(text, cls) { return `<span class="chip ${cls}">${text}</span>`; }
+
+async function refresh() {
+  const s = await api('/api/status');
+
+  // keys
+  $('keys-body').innerHTML = s.keys.map(k => `
+    <tr>
+      <td><b>${k.version}</b>${k.is_current ? ' ' + chip('当前加密','ok') : ''}</td>
+      <td class="state-${k.state}">${k.state}</td>
+      <td>${k.is_current ? '是' : '否'}</td>
+      <td>${k.file_references}</td>
+      <td>${k.in_flight_downloads}</td>
+      <td>
+        ${(!k.is_current && k.state==='active') ? `<button onclick="retire('${k.version}')">仅解密</button>` : ''}
+        ${k.can_disable ? `<button class="danger" onclick="disableKey('${k.version}')">停用并销毁</button>`
+          : `<span class="muted">不可停用</span>`}
+      </td>
+    </tr>`).join('');
+
+  // old keys with references
+  const old = await api('/api/keys/old-references');
+  $('old-body').innerHTML = old.keys.length ? old.keys.map(k => `
+    <tr><td>${k.version}</td><td class="state-${k.state}">${k.state}</td>
+        <td>${k.file_references}</td><td>${k.in_flight_downloads}</td>
+        <td>${k.can_disable ? chip('可停用','ok') : chip('仍被引用','failed')}</td></tr>`).join('')
+    : '<tr><td colspan="5" class="muted">没有旧密钥持有引用</td></tr>';
+
+  // target version select: only active keys
+  const sel = $('target-version');
+  const prev = sel.value;
+  sel.innerHTML = s.keys.filter(k => k.state==='active')
+    .map(k => `<option value="${k.version}">${k.version}${k.is_current?'（当前）':''}</option>`).join('');
+  if ([...sel.options].some(o => o.value === prev)) sel.value = prev;
+
+  // files
+  $('files-body').innerHTML = s.files.map(f => `
+    <tr>
+      <td>${f.file_id}</td>
+      <td>${chip(f.key_version, 'ok')}</td>
+      <td style="font-family:monospace;font-size:11px">${f.plaintext_sha256.slice(0,20)}…</td>
+      <td>${f.size}</td>
+      <td class="${f.verify_status}">${f.verify_status}
+        ${f.verify_error ? '<div class="muted">'+f.verify_error+'</div>' : ''}</td>
+      <td>
+        <button onclick="verify('${f.file_id}')">校验</button>
+        <button class="danger" onclick="injectFault('${f.file_id}')">注入失败</button>
+        <button onclick="recover('${f.file_id}')">恢复</button>
+      </td>
+    </tr>`).join('');
+
+  const qf = $('query-file');
+  const qprev = qf.value;
+  qf.innerHTML = s.files.map(f => `<option>${f.file_id}</option>`).join('');
+  if ([...qf.options].some(o => o.value === qprev)) qf.value = qprev;
+
+  // job
+  const j = s.job;
+  if (!j) { $('job-meta').textContent = '暂无任务'; $('job-body').innerHTML='';
+            $('job-log').textContent='（空）'; $('bar').style.width='0%'; return; }
+  const c = j.counts;
+  $('job-meta').innerHTML = `任务 <b>${j.job_id}</b> · 目标 <b>${j.target_version}</b>
+     · 策略 <b>${j.mode === 'cutover' ? '整版切换' : '兼容混合'}</b>
+     · 状态 <b class="${j.status==='failed'?'failed':'ok'}">${j.status}</b>
+     · 完成 ${c.done}/${c.total}，失败 ${c.failed}`;
+  $('bar').style.width = (100 * c.done / c.total) + '%';
+  $('job-body').innerHTML = j.items.map(i => `
+    <tr><td>${i.file_id}</td><td>${i.from_version} → ${j.target_version}</td>
+        <td class="${i.status}">${i.status}</td>
+        <td class="muted">${i.error || ''}</td><td>${i.finished_at || ''}</td></tr>`).join('');
+  $('job-log').textContent = j.log.join('\n') || '（空）';
+}
+refresh();
+setInterval(refresh, 1500);
+</script>
+</body>
+</html>
